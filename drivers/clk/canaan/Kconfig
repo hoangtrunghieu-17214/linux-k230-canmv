@@ -1,0 +1,11 @@
+# SPDX-License-Identifier: GPL-2.0-only
+
+menuconfig K230_COMMON_CLK
+    bool "Canaan Kendryte K230 Clock support"
+    depends on OF
+    depends on ARCH_CANAAN || COMPILE_TEST
+    depends on COMMON_CLK
+    depends on HAS_IOMEM
+    default ARCH_CANAAN
+    help
+      Support for the Canaan Kendryte K230 RISC-V SoC clocks.
