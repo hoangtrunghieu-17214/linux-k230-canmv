@@ -4,6 +4,7 @@
  */
 
 #include <dt-bindings/interrupt-controller/irq.h>
+#include <dt-bindings/clock/canaan,k230-clk.h>
 
 /dts-v1/;
 / {
@@ -73,6 +74,13 @@
 			clock-accuracy = <0>;
 			status = "okay";
 			clock-output-names = "osc24m";
+		};
+
+		dummy_sd: apb-sdclock {
+			compatible = "fixed-clock";
+			clock-frequency = <100000000>;
+			clock-output-names = "dummy_sd";
+			#clock-cells = <0>;
 		};
 	};
 
@@ -166,6 +174,32 @@
 				clock-names = "osc24m";
 				#clock-cells = <1>;
 			};
+		};
+
+		mmc_sd0: sdhci0@91580000 {
+			status = "disabled";
+			compatible = "kendryte,k230-dwcmshc";
+			reg = <0x0 0x91580000 0x0 0x1000>;
+			interrupts = <142 IRQ_TYPE_LEVEL_HIGH>;
+			interrupt-names = "sdhci0irq";
+			clocks = <&cmu K230_SD0_GATE_CCLK>, <&cmu K230_SD0_GATE_CCLK>;
+			clock-names = "core", "bus";
+			sdhci,auto-cmd12;
+			max-frequency = <200000000>;
+			bus-width = <8>;
+		};
+
+		mmc_sd1: sdhci1@91581000 {
+			status = "disabled";
+			compatible = "kendryte,k230-dwcmshc";
+			reg = <0x0 0x91581000 0x0 0x1000>;
+			interrupts = <144 IRQ_TYPE_LEVEL_HIGH>;
+			interrupt-names = "sdhci1irq";
+			clocks = <&dummy_sd>, <&dummy_sd>;
+			clock-names = "core", "bus";
+			sdhci,auto-cmd12;
+			max-frequency = <50000000>;
+			bus-width = <4>;
 		};
 	};
 };

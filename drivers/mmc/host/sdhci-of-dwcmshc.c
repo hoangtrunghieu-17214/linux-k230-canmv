@@ -153,6 +153,9 @@
 #define PHY_PAD_TXSLEW_CTRL_N		0x3 /* Slew control for N-Type pad TX */
 #define PHY_PAD_TXSLEW_CTRL_N_SG2042	0x2 /* Slew control for N-Type pad TX for SG2042 */
 
+/* Command register */
+#define PHY_COMMDL_CNFG_R                (DWC_MSHC_PTR_PHY_R + 0x1c)
+
 /* PHY CLK delay line settings */
 #define PHY_SDCLKDL_CNFG_R		(DWC_MSHC_PTR_PHY_R + 0x1d)
 #define PHY_SDCLKDL_CNFG_EXTDLY_EN	BIT(0)
@@ -208,6 +211,16 @@
 enum dwcmshc_rk_type {
 	DWCMSHC_RK3568,
 	DWCMSHC_RK3588,
+};
+
+struct kendryte_priv {
+	void __iomem *hs_regs;
+	// There are 2 delay lines: For write - dwcmshc_priv.delay_line
+	// & read - rx_delay_line (the one below)
+	u16 rx_delay_line;
+	u8 mshc_ctrl_r;
+	bool have_phy;
+	bool is_emmc;
 };
 
 struct rk35xx_priv {
@@ -1113,6 +1126,157 @@ static int sg2042_init(struct device *dev, struct sdhci_host *host,
 					     ARRAY_SIZE(clk_ids), clk_ids);
 }
 
+static int k230_sdhci_init(struct device *dev, struct sdhci_host *host, struct dwcmshc_priv *dwc_priv)
+{
+	dev_info(dev, "kendryte SD card detected");
+	u32 data;
+	int err;
+
+	struct kendryte_priv *priv = devm_kzalloc(dev, sizeof(struct kendryte_priv), GFP_KERNEL);
+	priv->hs_regs = devm_ioremap(dev, 0x91585000, 0x400);
+
+	if (memcmp(host->hw_name, "91581000", 8) == 0) {
+		priv->have_phy = false;
+		data = readl(priv->hs_regs + 8);
+		data |= BIT(2) | BIT(0);
+		writel(data, priv->hs_regs + 8);
+	} else {
+		priv->have_phy = true;
+		data = readl(priv->hs_regs);
+		data |= BIT(6) | BIT(4);
+		writel(data, priv->hs_regs);
+	}
+
+	if (priv->have_phy) {
+		if (device_property_read_bool(dev, "io_fixed_1v8")) {
+			dwc_priv->flags |= FLAG_IO_FIXED_1V8;
+		} else {
+			dwc_priv->flags &= ~FLAG_IO_FIXED_1V8;
+		}
+
+		err = device_property_read_u16(dev, "tx_delay_line", &dwc_priv->delay_line);
+		if (err)
+			dwc_priv->delay_line = PHY_SDCLKDL_DC_INITIAL;
+
+		err = device_property_read_u16(dev, "rx_delay_line", &priv->rx_delay_line);
+		if (err)
+			priv->rx_delay_line = 0xd;
+	} else {
+		err = device_property_read_u8(dev, "mshc_ctrl_r", &priv->mshc_ctrl_r);
+		if (err)
+			priv->mshc_ctrl_r = 0;
+	}
+
+	if (dwc_priv->flags & FLAG_IO_FIXED_1V8) {
+		host->flags |= SDHCI_SIGNALING_180;
+		host->flags &= ~SDHCI_SIGNALING_330;
+	}
+
+	dwc_priv->priv = priv;
+	return 0;
+}
+
+static void k230_sdhci_phy_delay_config(struct sdhci_host *host)
+{
+	struct sdhci_pltfm_host *pltfm_host = sdhci_priv(host);
+	struct dwcmshc_priv *priv = sdhci_pltfm_priv(pltfm_host);
+	struct kendryte_priv *kendryte_priv = priv->priv;
+
+	sdhci_writeb(host, 1, PHY_COMMDL_CNFG_R);
+	if (priv->delay_line > 256) {
+		pr_info("%s: tx_delay_line err\n", mmc_hostname(host->mmc));
+	} else if (priv->delay_line > 128) {
+		sdhci_writeb(host, 1, PHY_SDCLKDL_CNFG_R);
+		sdhci_writeb(host, priv->delay_line - 128, PHY_SDCLKDL_DC_R);
+	} else {
+		sdhci_writeb(host, 0, PHY_SDCLKDL_CNFG_R);
+		sdhci_writeb(host, priv->delay_line, PHY_SDCLKDL_DC_R);
+	}
+	sdhci_writeb(host, kendryte_priv->rx_delay_line, PHY_SMPLDL_CNFG_R);
+	sdhci_writeb(host, 0xc, PHY_ATDL_CNFG_R);
+
+	int vendor_ctrl_reg = priv->vendor_specific_area1 + 0x40;
+	u32 vendor_ctrl_val = sdhci_readl(host, vendor_ctrl_reg);
+	vendor_ctrl_val |= BIT(16) | BIT(17) | BIT(19) | BIT(20);
+	sdhci_writel(host, vendor_ctrl_val, vendor_ctrl_reg);
+
+	int vendor_stat_reg = priv->vendor_specific_area1 + 0x44;
+	sdhci_writel(host, 0, vendor_stat_reg);
+}
+
+static void k230_sdhci_phy_init(struct sdhci_host *host)
+{
+	struct sdhci_pltfm_host *pltfm_host = sdhci_priv(host);
+	struct dwcmshc_priv *priv = sdhci_pltfm_priv(pltfm_host);
+	u32 reg;
+	int timeout_err;
+
+	/* reset phy */
+	sdhci_writew(host, 0, PHY_CNFG_R);
+
+	/* Disable the clock */
+	sdhci_writew(host, 0, SDHCI_CLOCK_CONTROL);
+
+	if (priv->flags & FLAG_IO_FIXED_1V8) {
+		// TODO: Check & fix duplicate
+		u16 data = sdhci_readw(host, SDHCI_HOST_CONTROL2);
+		data |= SDHCI_CTRL_VDD_180;
+		sdhci_writew(host, data, SDHCI_HOST_CONTROL2);
+		dwcmshc_phy_1_8v_init(host);
+	} else {
+		dwcmshc_phy_3_3v_init(host);
+	}
+
+	k230_sdhci_phy_delay_config(host);
+
+	// Wait for PWRGOOD status, up to 150 ms
+	timeout_err = readl_poll_timeout_atomic(host->ioaddr + PHY_CNFG_R, reg,
+						(reg & BIT(1)), 5,
+						150 * USEC_PER_MSEC);
+
+	if (unlikely(timeout_err == -ETIMEDOUT)) {
+		pr_warn("[%s]: Timed out while waiting for PWRGOOD status.", __func__);
+		return;
+	}
+
+	reg = FIELD_PREP(PHY_CNFG_PAD_SN_MASK, PHY_CNFG_PAD_SN);
+	reg |= FIELD_PREP(PHY_CNFG_PAD_SP_MASK, PHY_CNFG_PAD_SP);
+
+	sdhci_writel(host, reg, PHY_CNFG_R);
+
+	/* de-assert the phy */
+	reg |= PHY_CNFG_RSTN_DEASSERT;
+	sdhci_writel(host, reg, PHY_CNFG_R);
+}
+
+static void k230_sdhci_reset(struct sdhci_host *host, u8 mask)
+{
+	struct sdhci_pltfm_host *pltfm_host = sdhci_priv(host);
+	struct dwcmshc_priv *priv = sdhci_pltfm_priv(pltfm_host);
+	struct kendryte_priv *kendryte_priv = priv->priv;
+
+	sdhci_reset(host, mask);
+
+	if (mask & SDHCI_RESET_ALL) {
+		int emmc_ctl_reg = priv->vendor_specific_area1 + DWCMSHC_EMMC_CONTROL;
+		u16 kendryte_emmc_ctl = sdhci_readw(host, emmc_ctl_reg);
+
+		if (kendryte_priv->is_emmc)
+			kendryte_emmc_ctl |= DWCMSHC_CARD_IS_EMMC;
+		else
+			kendryte_emmc_ctl &= ~DWCMSHC_CARD_IS_EMMC;
+
+		sdhci_writeb(host, kendryte_emmc_ctl, emmc_ctl_reg);
+
+		if (kendryte_priv->have_phy) {
+			k230_sdhci_phy_init(host);
+		} else {
+			int ctrl_reg = priv->vendor_specific_area1 + 0x08;
+			sdhci_writeb(host, kendryte_priv->mshc_ctrl_r, ctrl_reg);
+		}
+	}
+}
+
 static const struct sdhci_ops sdhci_dwcmshc_ops = {
 	.set_clock		= sdhci_set_clock,
 	.set_bus_width		= sdhci_set_bus_width,
@@ -1187,6 +1351,16 @@ static const struct sdhci_ops sdhci_dwcmshc_sg2042_ops = {
 	.platform_execute_tuning = th1520_execute_tuning,
 };
 
+static const struct sdhci_ops sdhci_dwcmshc_kendryte_ops = {
+	.set_clock		= sdhci_set_clock,
+	.set_bus_width		= sdhci_set_bus_width,
+	.set_uhs_signaling	= dwcmshc_set_uhs_signaling,
+	.get_max_clock		= dwcmshc_get_max_clock,
+	.reset			= k230_sdhci_reset,
+	.adma_write_desc	= dwcmshc_adma_write_desc,
+	.voltage_switch		= dwcmshc_phy_1_8v_init,
+};
+
 static const struct dwcmshc_pltfm_data sdhci_dwcmshc_pdata = {
 	.pdata = {
 		.ops = &sdhci_dwcmshc_ops,
@@ -1242,6 +1416,14 @@ static const struct dwcmshc_pltfm_data sdhci_dwcmshc_sg2042_pdata = {
 		.quirks2 = SDHCI_QUIRK2_PRESET_VALUE_BROKEN,
 	},
 	.init = sg2042_init,
+};
+
+static const struct dwcmshc_pltfm_data sdhci_dwcmshc_kendryte_pdata = {
+	.pdata = {
+		.ops = &sdhci_dwcmshc_kendryte_ops,
+		.quirks = SDHCI_QUIRK_CAP_CLOCK_BASE_BROKEN,
+	},
+	.init = k230_sdhci_init
 };
 
 static const struct cqhci_host_ops dwcmshc_cqhci_ops = {
@@ -1339,6 +1521,10 @@ static const struct of_device_id sdhci_dwcmshc_dt_ids[] = {
 	{
 		.compatible = "sophgo,sg2042-dwcmshc",
 		.data = &sdhci_dwcmshc_sg2042_pdata,
+	},
+	{
+		.compatible = "kendryte,k230-dwcmshc",
+		.data = &sdhci_dwcmshc_kendryte_pdata,
 	},
 	{},
 };
